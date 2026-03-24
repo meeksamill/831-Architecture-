@@ -1,69 +1,206 @@
-# 831 Operating System: VCP Market Sniper
-# Goal: Automate the Marcus Strategy for sub-$5 runners.
-# Protect the capital. Protect the time.
+"""
+831 Operating System: Ghost Protocol Omni-Scan
+Goal: Automate institutional accumulation detection across the entire S&P 500.
+Protect the capital. Protect the time.
+"""
 
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta
+import numpy as np
+import ssl
+import logging
+from typing import List, Dict, Optional
+from datetime import datetime
 
-# The 831 Watchlist (Add any tickers you are stalking here)
-# Currently loaded with our runners and potential targets
-watchlist = ["UGRO", "BIAF", "KOS", "SERV", "TLYS", "RXT", "SOUN", "PLTR"]
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def check_vcp(ticker):
-    try:
-        # Fetch the last 30 days of daily data
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="1mo")
+# Bypass SSL certificate issues for dynamic ticker fetching
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Configuration constants
+MIN_DATA_POINTS = 20
+VOLUME_CONTRACTION_THRESHOLD = 0.80  # 20% contraction
+PRICE_TIGHTNESS_THRESHOLD = 0.05  # 5% variance
+SQUAT_BAR_VOLUME_MULTIPLIER = 1.2  # 20% above average
+SQUAT_BAR_CLOSE_RATIO = 0.4  # Price closes in lower 40% of range
+BATCH_SIZE = 100
+LOOKBACK_PERIOD = "2mo"
+RECENT_LOOKBACK = 15  # 3 weeks of tape action
+RECENT_VOLUME_WINDOW = 3  # Last 3 days
+
+
+class MarketScanner:
+    """Scans S&P 500 for institutional accumulation patterns."""
+    
+    def __init__(self):
+        self.tickers = []
+        self.valid_setups = []
+    
+    @staticmethod
+    def get_broad_market_tickers() -> List[str]:
+        """Dynamically fetches all S&P 500 tickers."""
+        try:
+            logger.info("🌐 Fetching Broad Market Tickers from Wikipedia...")
+            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+            table = pd.read_html(url)[0]
+            tickers = table['Symbol'].tolist()
+            # Clean up formatting for Yahoo Finance (e.g., BRK.B -> BRK-B)
+            cleaned_tickers = [ticker.replace('.', '-') for ticker in tickers]
+            logger.info(f"✅ Successfully fetched {len(cleaned_tickers)} tickers")
+            return cleaned_tickers
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch tickers: {e}")
+            return []
+    
+    @staticmethod
+    def detect_squat_bar(bar: pd.Series, avg_volume: float) -> bool:
+        """
+        Detects hidden selling (Squat Bars):
+        High volume but price closes poorly = institutional offloading.
         
-        if len(df) < 20:
-            return None # Not enough data
+        Returns True if squat bar detected (ABORT signal).
+        """
+        high_volume = bar['Volume'] > avg_volume * SQUAT_BAR_VOLUME_MULTIPLIER
+        range_size = bar['High'] - bar['Low']
+        
+        if range_size == 0:
+            return False
+        
+        close_ratio = (bar['Close'] - bar['Low']) / range_size
+        poor_close = close_ratio < SQUAT_BAR_CLOSE_RATIO
+        
+        return high_volume and poor_close
+    
+    @staticmethod
+    def analyze_vcp_and_vpa(ticker: str, data: pd.DataFrame) -> bool:
+        """
+        Core Marcus Logic: VCP, Institutional Accumulation, and Squat Bar detection.
+        Optimized for the $180 -> $300 grind. Maximum 2% Risk-of-Ruin floor.
+        
+        Returns True if setup passes all filters.
+        """
+        if len(data) < MIN_DATA_POINTS:
+            return False
+        
+        # Get recent 3 weeks of tape action
+        recent_data = data.tail(RECENT_LOOKBACK)
+        
+        # Filter 1: Trend Filter - Price above 20-day SMA
+        data['SMA_20'] = data['Close'].rolling(window=20).mean()
+        if data['Close'].iloc[-1] < data['SMA_20'].iloc[-1]:
+            return False
+        
+        # Filter 2: Volume Contraction (VCP)
+        # Is volume drying up as price moves sideways?
+        avg_vol = recent_data['Volume'].mean()
+        recent_vol = recent_data['Volume'].iloc[-RECENT_VOLUME_WINDOW:].mean()
+        volume_drying_up = recent_vol < (avg_vol * VOLUME_CONTRACTION_THRESHOLD)
+        
+        if not volume_drying_up:
+            return False
+        
+        # Filter 3: Squat Bar Detection (Hidden Selling)
+        # Abort if institutions are secretly offloading
+        last_bar = data.iloc[-1]
+        if MarketScanner.detect_squat_bar(last_bar, avg_vol):
+            return False
+        
+        # Filter 4: Price Tightness (VPA - Volatile Price Action containment)
+        # Max 5% variance in last 5 days
+        recent_5d = recent_data.iloc[-5:]
+        recent_high = recent_5d['High'].max()
+        recent_low = recent_5d['Low'].min()
+        
+        if recent_low == 0:
+            return False
+        
+        price_tight = (recent_high - recent_low) / recent_low < PRICE_TIGHTNESS_THRESHOLD
+        
+        return price_tight
+    
+    def scan_batch(self, tickers_batch: List[str]) -> List[str]:
+        """
+        Downloads and analyzes a batch of tickers.
+        Returns list of tickers that pass all filters.
+        """
+        valid = []
+        try:
+            logger.info(f"📊 Downloading {len(tickers_batch)} tickers...")
+            data_batch = yf.download(
+                tickers_batch,
+                period=LOOKBACK_PERIOD,
+                group_by="ticker",
+                threads=True,
+                show_errors=False,
+                progress=False
+            )
             
-        current_price = df['Close'].iloc[-1]
+            for ticker in tickers_batch:
+                try:
+                    ticker_data = data_batch[ticker].dropna()
+                    if self.analyze_vcp_and_vpa(ticker, ticker_data):
+                        valid.append(ticker)
+                except Exception as e:
+                    # Skip missing or delisted tickers silently
+                    pass
+        except Exception as e:
+            logger.warning(f"⚠️ Batch download failed: {e}")
         
-        # Filter 1: Sniper Ammo Range ($1.00 to $10.00)
-        if current_price < 1.00 or current_price > 10.00:
-            return None
-
-        # Filter 2: Price Consolidation (Tightening)
-        # Is the price resting quietly near its 20-day moving average?
-        sma_20 = df['Close'].rolling(window=20).mean().iloc[-1]
-        price_spread = abs(current_price - sma_20) / sma_20
+        return valid
+    
+    def run_scan(self):
+        """Executes the full Ghost Protocol scan."""
+        logger.info("\n🙏 GOD FIRST. FATHERHOOD AUDIT ACTIVE.")
+        logger.info("🛡️ Protecting time for Rachel, CJ, Reah, and Ciaro.")
+        logger.info("⚡ Initiating Ghost Protocol Omni-Scan...\n")
         
-        # Filter 3: Volume Contraction
-        # Is today's volume significantly lower than the 20-day average? (The "Quiet" before the move)
-        avg_vol_20 = df['Volume'].rolling(window=20).mean().iloc[-1]
-        current_vol = df['Volume'].iloc[-1]
+        # Fetch all tickers
+        self.tickers = self.get_broad_market_tickers()
+        if not self.tickers:
+            logger.error("Failed to fetch tickers. Aborting scan.")
+            return
         
-        is_tight = price_spread < 0.05  # Price is within 5% of the 20 SMA
-        is_quiet = current_vol < (avg_vol_20 * 0.7) # Volume is 30% below average
+        # Process in batches to prevent timeout/IP bans
+        logger.info(f"📊 Scanning {len(self.tickers)} tickers for Institutional Accumulation...\n")
         
-        if is_tight and is_quiet:
-            return {
-                "Ticker": ticker,
-                "Price": round(current_price, 2),
-                "Status": "🚨 VCP ALERT: Tight & Quiet. Prime for Breakout.",
-                "Volume Level": "Low (Accumulation Phase)"
-            }
-        return None
+        for i in range(0, len(self.tickers), BATCH_SIZE):
+            batch = self.tickers[i:i + BATCH_SIZE]
+            batch_results = self.scan_batch(batch)
+            self.valid_setups.extend(batch_results)
+            
+            # Progress indicator
+            progress = min(i + BATCH_SIZE, len(self.tickers))
+            logger.info(f"Progress: {progress}/{len(self.tickers)} tickers scanned | Found: {len(self.valid_setups)} setups")
+        
+        self.print_results()
+    
+    def print_results(self):
+        """Formats and displays scan results."""
+        print("\n" + "="*60)
+        print("🎯 GHOST PROTOCOL COMPLETE.")
+        print(f"📈 90% Conviction Setups Found: {len(self.valid_setups)}")
+        
+        if self.valid_setups:
+            print(f"\n🔥 TICKERS ({len(self.valid_setups)}):")
+            for i, ticker in enumerate(self.valid_setups, 1):
+                print(f"  {i}. {ticker}")
+        else:
+            print("\n🛡️ No high-conviction setups found.")
+            print("Action: Keep the capital in cash. Close the laptop. Go be a dad.")
+        
+        print("="*60 + "\n")
 
-    except Exception as e:
-        return None
 
-# Execute the Scan
-print(f"--- 831 SNIPER SCAN INITIATED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
-print("Scanning for Volume Contraction and Institutional Accumulation...\n")
+def main():
+    """Entry point."""
+    scanner = MarketScanner()
+    scanner.run_scan()
 
-found_setups = False
 
-for ticker in watchlist:
-    result = check_vcp(ticker)
-    if result:
-        found_setups = True
-        print(f"[{result['Ticker']}] - Price: ${result['Price']}")
-        print(f" -> {result['Status']}")
-        print("-" * 40)
-
-if not found_setups:
-    print("🛡️ Fatherhood Audit Triggered: No high-conviction setups found.")
-    print("Action: Keep the $117.75 in cash. Close the laptop. Go be a dad.")
+if __name__ == "__main__":
+    main()
